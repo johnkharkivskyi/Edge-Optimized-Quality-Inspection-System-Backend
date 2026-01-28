@@ -29,6 +29,14 @@ def camera_worker():
     # Back to standard capture (no DSHOW to avoid crashes)
     cap = cv2.VideoCapture(0)
 
+    # 1. Disable Auto Exposure (0 or 1 usually means Manual)
+    #cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+
+    # 2. Set Exposure value (Lower = Faster Shutter = Less Blur)
+    # Typical values are -4 to -11. Start with -6.
+    # Note: The image will get DARKER, so you need more physical light.
+    #cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+
     # We set these but don't touch Exposure
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
