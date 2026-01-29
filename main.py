@@ -3,12 +3,20 @@ import base64
 import asyncio
 import time
 import threading
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from engine.model_provider import provider
 from utils.hardware import get_hardware_stats
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    threading.Thread(target=camera_worker, daemon=True).start()
+    threading.Thread(target=inference_worker, daemon=True).start()
+    threading.Thread(target=hardware_worker, daemon=True).start()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class GlobalState:
@@ -16,7 +24,7 @@ class GlobalState:
         self.frame = None
         self.encoded_image = None
         self.detections = []
-        self.latency = 0.0 # Changed to float
+        self.latency = 0.0
         self.fps = 0
         self.hw = {"cpu": 0, "ram": 0, "gpu": 0, "platform": "Init..."}
 
@@ -42,10 +50,9 @@ def camera_worker():
 
 def inference_worker():
     while True:
-        try: # --- LATENCY FIX: Safety guard ---
+        try:
             if state.frame is not None:
                 model = provider.get_active_model()
-                # Ensure we capture the return values correctly
                 result = model.predict(state.frame)
                 if result is not None:
                     state.detections, state.latency = result
@@ -57,12 +64,6 @@ def hardware_worker():
     while True:
         state.hw = get_hardware_stats()
         time.sleep(0.5)
-
-@app.on_event("startup")
-async def startup_event():
-    threading.Thread(target=camera_worker, daemon=True).start()
-    threading.Thread(target=inference_worker, daemon=True).start()
-    threading.Thread(target=hardware_worker, daemon=True).start()
 
 @app.websocket("/ws/stream")
 async def stream(websocket: WebSocket):
@@ -81,7 +82,7 @@ async def stream(websocket: WebSocket):
                     "image": state.encoded_image,
                     "detections": state.detections,
                     "metrics": {
-                        "latency": float(state.latency), # Ensure it is a float
+                        "latency": float(state.latency),
                         "fps": state.fps,
                         "mode": provider.current_mode,
                         **state.hw

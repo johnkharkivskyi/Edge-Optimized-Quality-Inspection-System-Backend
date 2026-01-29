@@ -44,14 +44,14 @@ class RealQualityModel:
                         "student.features", "student").replace("teacher.features", "teacher")
                     new_state_dict[new_key] = v
                 self.model.load_state_dict(new_state_dict, strict=False)
-                print(f"✅ Model loaded on {self.device}")
+                print(f"Model loaded on {self.device}")
             except Exception as e:
-                print(f"⚠️ Model load warning: {e}")
+                print(f"Model load warning: {e}")
         self.model.eval().float()
 
     def predict(self, frame):
         start_time = time.time()
-        try:  # --- LATENCY FIX: Wrap in try/except ---
+        try:
             h, w = frame.shape[:2]
             img_res = cv2.resize(frame, (self.img_size, self.img_size), interpolation=cv2.INTER_AREA)
             img_rgb = cv2.cvtColor(img_res, cv2.COLOR_BGR2RGB)
@@ -100,6 +100,5 @@ class RealQualityModel:
             return detections, (time.time() - start_time) * 1000
 
         except Exception as e:
-            # If AI fails, return 0 detections but correct time elapsed
             print(f"Inference Error: {e}")
             return [], (time.time() - start_time) * 1000
