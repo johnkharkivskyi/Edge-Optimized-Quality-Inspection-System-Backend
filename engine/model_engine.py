@@ -8,112 +8,116 @@ import time
 import os
 
 
-class EfficientNetAE(nn.Module):
+# 1. THE UPDATED ARCHITECTURE (Distillation / STFPM style)
+# We now have a Student and Teacher instead of an Encoder and Decoder
+class DistillationModel(nn.Module):
     def __init__(self):
         super().__init__()
-        # Backbone is EfficientNet-B0 (Optimal for Edge)
-        backbone = models.efficientnet_b0(weights=None)
-        self.encoder = backbone.features
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(1280, 256, 4, 2, 1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(256, 64, 4, 2, 1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 3, 4, 2, 1),
-            nn.Sigmoid()
-        )
+        # Both are EfficientNet-B0
+        self.student = models.efficientnet_b0(weights=None).features
+        self.teacher = models.efficientnet_b0(weights=None).features
+        # We don't train the teacher, so it stays frozen
+        for param in self.teacher.parameters():
+            param.requires_grad = False
 
     def forward(self, x):
-        return F.interpolate(self.decoder(self.encoder(x)), size=(256, 256))
+        s_feat = self.student(x)
+        t_feat = self.teacher(x)
+        return s_feat, t_feat
 
 
+# 2. THE WRAPPER
 class RealQualityModel:
     def __init__(self, mode="FP32"):
+        # CRITICAL FIX: Define attributes FIRST so they exist even if loading fails
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = EfficientNetAE().to(self.device)
-
-        # Load Weights
-        model_path = os.path.join("engine", "best_model.pth")
-        if os.path.exists(model_path):
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
-            print(f"✅ Production Model Active on {self.device}")
-
-        self.model.float().eval()
         self.img_size = 256
-
-        # Performance Cache
         self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
         self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
+        self.mode = mode
 
-        # Temporal Smoothing (Prevents flickering boxes)
-        self.prev_anomaly_map = None
+        # Initialize Model
+        self.model = DistillationModel().to(self.device)
+
+        model_path = os.path.join("engine", "best_model.pth")
+        if os.path.exists(model_path):
+            try:
+                checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+
+                # Extract the correct state dict
+                if isinstance(checkpoint, dict) and "model_state" in checkpoint:
+                    state_dict = checkpoint["model_state"]
+                else:
+                    state_dict = checkpoint
+
+                # --- KEY MAPPING HACK ---
+                # Your checkpoint has keys like 'student_base.features...' or 'student.features...'
+                # Our class expects 'student...' and 'teacher...'
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    new_key = k.replace('student_base.features', 'student')
+                    new_key = new_key.replace('teacher_base.features', 'teacher')
+                    new_key = new_key.replace('student.features', 'student')  # handle both
+                    new_key = new_key.replace('teacher.features', 'teacher')
+                    new_state_dict[new_key] = v
+
+                # Load with strict=False to ignore any extra keys (like Adapters or Optimizers)
+                self.model.load_state_dict(new_state_dict, strict=False)
+                print(f"✅ SUCCESS: Distillation model loaded on {self.device}")
+
+            except Exception as e:
+                print(f"⚠️ MODEL LOAD WARNING: {e}")
+
+        self.model.float().eval()
 
     def predict(self, frame):
         start_time = time.time()
-
-        # 1. OPTIMIZED PREPROCESSING (Vectorized)
         h, w = frame.shape[:2]
-        # Fast resize using INTER_AREA (best for downscaling)
+
+        # --- PREPROCESSING ---
         img_res = cv2.resize(frame, (self.img_size, self.img_size), interpolation=cv2.INTER_AREA)
         img_rgb = cv2.cvtColor(img_res, cv2.COLOR_BGR2RGB)
 
-        # Move to GPU immediately to do normalization there (much faster)
         with torch.no_grad():
             img_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float().unsqueeze(0).to(self.device) / 255.0
             input_norm = (img_tensor - self.mean) / self.std
 
-            # 2. INFERENCE
-            reconstruction = self.model(input_norm)
+            # --- INFERENCE (Distillation Style) ---
+            # Instead of reconstruction, we compare the features
+            s_feat, t_feat = self.model(input_norm)
 
-            # 3. STRUCTURAL ANOMALY CALCULATION
-            # We compare L1 (pixels) + SSIM-like structural loss
-            l1_diff = torch.abs(img_tensor - reconstruction)
-            anomaly_map = torch.mean(l1_diff, dim=1).squeeze()
+            # Anomaly map = Cosine distance or Euclidean distance between features
+            # We resize the feature map back to 256x256
+            diff = F.mse_loss(s_feat, t_feat, reduction='none')
+            anomaly_map = torch.mean(diff, dim=1).squeeze()
+            anomaly_map = F.interpolate(anomaly_map.unsqueeze(0).unsqueeze(0), size=(256, 256),
+                                        mode='bilinear').squeeze()
 
-            # 4. SPATIAL SMOOTHING (Gaussian Blur on GPU)
-            # This kills pixel-level camera noise
-            anomaly_map = anomaly_map.unsqueeze(0).unsqueeze(0)
-            kernel_size = 11
-            sigma = 4.0
-            anomaly_map = F.avg_pool2d(anomaly_map, kernel_size, stride=1, padding=kernel_size // 2)
-
-            # 5. DYNAMIC RANGE SCALING (The "Magic" Step)
-            # This makes the defect "pop" out from the background regardless of light
+            # Self-Calibration
             map_min, map_max = anomaly_map.min(), anomaly_map.max()
             anomaly_map = (anomaly_map - map_min) / (map_max - map_min + 1e-6)
 
-            # Move back to CPU for OpenCV post-processing
-            final_map = anomaly_map.squeeze().cpu().numpy()
+            final_map = anomaly_map.cpu().numpy()
 
-        # 6. ADAPTIVE THRESHOLDING (Otsu-inspired)
-        # We only look for the top 3% of "angriest" pixels
-        threshold = np.percentile(final_map, 97)
-        # Minimum noise floor (if everything is perfect, don't show anything)
-        threshold = max(threshold, 0.4)
+        # --- POST-PROCESSING ---
+        # With distillation, the 'suspicion' is usually in the top 2% of pixels
+        threshold = max(np.percentile(final_map, 98), 0.35)
 
         mask = (final_map > threshold).astype(np.uint8) * 255
-
-        # Clean up the mask using Morphological Gradient
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.dilate(mask, kernel, iterations=1)
 
-        # 7. CONTOUR ANALYSIS
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         detections = []
         for cnt in contours:
-            area = cv2.contourArea(cnt)
-            # Only count defects that are significant in size
-            if area > 300:
+            if cv2.contourArea(cnt) > 300:
                 x, y, w_box, h_box = cv2.boundingRect(cnt)
-
-                # Rescale to original camera resolution
                 scale_x, scale_y = w / self.img_size, h / self.img_size
 
-                # Confidence is based on the intensity of the anomaly relative to threshold
-                local_intensity = np.mean(final_map[y:y + h_box, x:x + w_box])
-                conf = min(0.99, 0.8 + local_intensity)
+                intensity = np.mean(final_map[y:y + h_box, x:x + w_box])
+                conf = min(0.99, 0.85 + intensity)
 
                 detections.append({
                     "label": "ANOMALY",

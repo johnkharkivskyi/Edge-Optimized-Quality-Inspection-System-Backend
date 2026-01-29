@@ -6,6 +6,9 @@ __pycache__/
 db.sqlite3
 backend/venv/
 
+# --- Model ---
+.pth
+
 # --- IDEs & System ---
 .idea/
 .vscode/
